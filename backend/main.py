@@ -113,6 +113,38 @@ def list_leads():
         leads.append(lead)
     return leads
 
+@app.get("/api/leads/missed")
+def missed_leads(hours_threshold: int = 48):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM leads WHERE status = 'new' ORDER BY created_at ASC").fetchall()
+    conn.close()
+
+    missed = []
+    now = datetime.utcnow()
+
+    for row in rows:
+        lead = dict(row)
+        created = datetime.fromisoformat(lead["created_at"])
+        hours_waiting = (now - created).total_seconds() / 3600
+
+        if hours_waiting >= hours_threshold:
+            lead["scoring"] = calculate_lead_score(lead)
+            lead["hours_waiting"] = round(hours_waiting, 1)
+            lead["reason"] = f"No contact for {round(hours_waiting)} hours since submission"
+            missed.append(lead)
+
+    estimated_opportunity = sum(
+        500 if l["scoring"]["temperature"] == "Hot" else
+        250 if l["scoring"]["temperature"] == "Warm" else 100
+        for l in missed
+    )
+
+    return {
+        "count": len(missed),
+        "estimated_opportunity": estimated_opportunity,
+        "leads": missed
+    }
+
 @app.get("/api/leads/{lead_id}")
 def get_lead(lead_id: int):
     conn = get_db()
