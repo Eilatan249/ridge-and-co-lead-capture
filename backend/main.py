@@ -49,6 +49,41 @@ def init_db():
 def on_startup():
     init_db()
 
+def calculate_lead_score(lead: dict) -> dict:
+    reasons = []
+    score = 0
+
+    if lead.get("phone"):
+        score += 15
+        reasons.append({"points": 15, "reason": "Provided phone number"})
+
+    if lead.get("message") and len(lead["message"]) > 20:
+        score += 15
+        reasons.append({"points": 15, "reason": "Included detailed message"})
+
+    high_value_services = ["Remodeling", "Landscaping"]
+    if lead.get("service") in high_value_services:
+        score += 20
+        reasons.append({"points": 20, "reason": f"Requested {lead['service']} (high-value service)"})
+    elif lead.get("service"):
+        score += 10
+        reasons.append({"points": 10, "reason": f"Requested {lead['service']}"})
+
+    created = datetime.fromisoformat(lead["created_at"])
+    hours_old = (datetime.utcnow() - created).total_seconds() / 3600
+    if hours_old < 24:
+        score += 15
+        reasons.append({"points": 15, "reason": "Submitted within the last 24 hours"})
+
+    if score >= 50:
+        temperature = "Hot"
+    elif score >= 25:
+        temperature = "Warm"
+    else:
+        temperature = "Cold"
+
+    return {"score": score, "temperature": temperature, "reasons": reasons}
+
 @app.get("/")
 def read_root():
     return {"message": "Ridge & Co API is running"}
@@ -71,7 +106,23 @@ def list_leads():
     conn = get_db()
     rows = conn.execute("SELECT * FROM leads ORDER BY created_at DESC").fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    leads = []
+    for row in rows:
+        lead = dict(row)
+        lead["scoring"] = calculate_lead_score(lead)
+        leads.append(lead)
+    return leads
+
+@app.get("/api/leads/{lead_id}")
+def get_lead(lead_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return {"error": "Lead not found"}
+    lead = dict(row)
+    lead["scoring"] = calculate_lead_score(lead)
+    return lead
 
 @app.patch("/api/leads/{lead_id}")
 def update_status(lead_id: int, update: StatusUpdate):
