@@ -63,19 +63,33 @@ def init_db():
             executed_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lead_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (lead_id) REFERENCES leads (id)
+        )
+    """)
     conn.commit()
     conn.close()
 
-# Sequence definition: (wait time before this step, description of what happens)
-# Step 0 = immediate confirmation (already handled at creation)
+def log_activity(conn, lead_id: int, event_type: str, description: str):
+    """Records a real event. Call this any time something actually happens to a lead."""
+    conn.execute(
+        "INSERT INTO activity_log (lead_id, event_type, description, created_at) VALUES (?, ?, ?, ?)",
+        (lead_id, event_type, description, datetime.utcnow().isoformat())
+    )
+
+VALID_STATUSES = ["new", "contacted", "engaged", "booked", "won", "closed"]
+
 SEQUENCE_STEPS = [
     {"step": 1, "wait_minutes": 2, "action": "Follow-up #1: Checking in on your request"},
     {"step": 2, "wait_minutes": 5, "action": "Follow-up #2: Still interested? Let's talk"},
     {"step": 3, "wait_minutes": 10, "action": "Final follow-up: Last check-in"},
 ]
-# NOTE: wait_minutes is set very short (2/5/10 min) for demo purposes so you
-# can watch it work in real time. In a real deployment these would be
-# wait_minutes = 2 days, 3 days, 5 days, etc.
 
 def enroll_lead_in_automation(lead_id: int):
     conn = get_db()
@@ -89,7 +103,6 @@ def enroll_lead_in_automation(lead_id: int):
     conn.close()
 
 def run_due_automations():
-    """Called by the scheduler every minute. Checks for due follow-ups and executes them."""
     conn = get_db()
     now = datetime.utcnow().isoformat()
 
@@ -106,9 +119,9 @@ def run_due_automations():
         if lead is None:
             continue
 
-        # Stop condition: lead already contacted/closed manually
         if lead["status"] != "new":
             conn.execute("UPDATE automation_enrollments SET stopped = 1 WHERE id = ?", (enrollment["id"],))
+            log_activity(conn, lead_id, "automation_stopped", "Automation stopped — lead status changed")
             conn.commit()
             continue
 
@@ -119,13 +132,13 @@ def run_due_automations():
 
         step_info = SEQUENCE_STEPS[current_step]
 
-        # "Send" the follow-up (demo mode: log it, same pattern as your email logging)
         print(f"[AUTOMATION] Lead {lead_id} ({lead['name']}): {step_info['action']}")
 
         conn.execute(
             "INSERT INTO automation_log (lead_id, step, action, executed_at) VALUES (?, ?, ?, ?)",
             (lead_id, step_info["step"], step_info["action"], datetime.utcnow().isoformat())
         )
+        log_activity(conn, lead_id, "follow_up_sent", step_info["action"])
 
         next_step = current_step + 1
         if next_step < len(SEQUENCE_STEPS):
@@ -137,6 +150,7 @@ def run_due_automations():
             )
         else:
             conn.execute("UPDATE automation_enrollments SET stopped = 1 WHERE id = ?", (enrollment["id"],))
+            log_activity(conn, lead_id, "automation_complete", "Follow-up sequence completed")
 
         conn.commit()
 
@@ -201,8 +215,12 @@ def create_lead(lead: LeadCreate):
         "INSERT INTO leads (name, email, phone, service, message, status, created_at) VALUES (?, ?, ?, ?, ?, 'new', ?)",
         (lead.name, lead.email, lead.phone, lead.service, lead.message, now)
     )
-    conn.commit()
     new_id = cursor.lastrowid
+
+    log_activity(conn, new_id, "lead_created", f"{lead.name} submitted a new request" + (f" for {lead.service}" if lead.service else ""))
+    log_activity(conn, new_id, "confirmation_sent", "Automatic confirmation sent")
+
+    conn.commit()
     conn.close()
 
     enroll_lead_in_automation(new_id)
@@ -253,6 +271,19 @@ def missed_leads(hours_threshold: int = 48):
         "leads": missed
     }
 
+@app.get("/api/activity")
+def get_recent_activity(limit: int = 15):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT activity_log.*, leads.name as lead_name
+        FROM activity_log
+        JOIN leads ON activity_log.lead_id = leads.id
+        ORDER BY activity_log.created_at DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
 @app.get("/api/leads/{lead_id}/automation")
 def get_lead_automation(lead_id: int):
     conn = get_db()
@@ -275,6 +306,15 @@ def get_lead_automation(lead_id: int):
         "history": [dict(l) for l in log]
     }
 
+@app.get("/api/leads/{lead_id}/activity")
+def get_lead_activity(lead_id: int):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM activity_log WHERE lead_id = ? ORDER BY created_at ASC", (lead_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
 @app.get("/api/leads/{lead_id}")
 def get_lead(lead_id: int):
     conn = get_db()
@@ -288,8 +328,18 @@ def get_lead(lead_id: int):
 
 @app.patch("/api/leads/{lead_id}")
 def update_status(lead_id: int, update: StatusUpdate):
+    if update.status not in VALID_STATUSES:
+        return {"error": f"Invalid status. Must be one of: {', '.join(VALID_STATUSES)}"}
+
     conn = get_db()
+    old = conn.execute("SELECT status FROM leads WHERE id = ?", (lead_id,)).fetchone()
+    old_status = old["status"] if old else None
+
     conn.execute("UPDATE leads SET status = ? WHERE id = ?", (update.status, lead_id))
+
+    if old_status and old_status != update.status:
+        log_activity(conn, lead_id, "status_changed", f"Status changed from {old_status} to {update.status}")
+
     conn.commit()
     conn.close()
     return {"id": lead_id, "status": update.status}
